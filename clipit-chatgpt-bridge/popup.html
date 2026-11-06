@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClipIt AI Bridge</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="brand">
+        <div class="logo-box">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v1"></path>
+            <path d="M18 8h4a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-4"></path>
+            <circle cx="8" cy="12" r="2"></circle>
+          </svg>
+        </div>
+        <div class="title-group">
+          <span class="title">ClipIt AI Bridge</span>
+          <span class="version">v1.3.0</span>
+        </div>
+      </div>
+      
+      <!-- Right-side header controls: Dot that turns green + On/Off power button -->
+      <div class="header-controls">
+        <div id="statusDot" class="status-dot disconnected" title="Connection status"></div>
+        <button id="powerBtn" class="power-toggle on" title="Toggle Bridge Completely On/Off">
+          <span class="power-knob"></span>
+          <span id="powerText" class="power-text">ON</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="status-container">
+      <div class="status-row">
+        <div class="status-label">Desktop Bridge</div>
+        <div id="activePlatformBadge" class="platform-badge">ChatGPT</div>
+      </div>
+      <div id="statusText" class="status-badge disconnected">Disconnected</div>
+      <div id="detailsText" class="status-details">Waiting for ClipIt desktop app on port 28475...</div>
+    </div>
+
+    <div class="port-info">
+      <span>Target WebSocket:</span>
+      <code>ws://127.0.0.1:28475</code>
+    </div>
+
+    <div class="actions">
+      <button id="toggleBtn" class="btn primary">Connect</button>
+    </div>
+
+    <!-- Quick Open Supported Platforms -->
+    <div class="quick-launch-section">
+      <div class="section-title">Open AI Chatbot:</div>
+      <div class="launch-grid">
+        <button id="chatgptBtn" class="launch-btn" title="Open ChatGPT">
+          <span class="launch-icon">🤖</span>
+          <span>ChatGPT</span>
+        </button>
+        <button id="claudeBtn" class="launch-btn" title="Open Claude AI">
+          <span class="launch-icon">🧠</span>
+          <span>Claude</span>
+        </button>
+        <button id="geminiBtn" class="launch-btn" title="Open Google Gemini">
+          <span class="launch-icon">✨</span>
+          <span>Gemini</span>
+        </button>
+        <button id="arenaBtn" class="launch-btn" title="Open Arena AI (Direct Chat)">
+          <span class="launch-icon">⚔️</span>
+          <span>Arena AI</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="instructions">
+      <p class="inst-title">Quick Guide:</p>
+      <ol>
+        <li>Keep the <b>ON/OFF switch</b> toggled <b>ON</b>.</li>
+        <li>Open any supported chatbot: <b>ChatGPT</b>, <b>Claude</b>, <b>Gemini</b>, or <b>Arena AI</b>.</li>
+        <li>For Arena AI, make sure you are in the <b>Direct Chat</b> tab.</li>
+        <li>In ClipIt app, click <b>Connect</b>, then test with <b>"hi there"</b>.</li>
+      </ol>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

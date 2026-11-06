@@ -1,0 +1,165 @@
+CLIPIT PROMPT SYSTEM - MESSAGE TEMPLATES AND WIRING NOTES
+Companion to clipit_master_prompt.txt. Placeholders in {{DOUBLE_BRACES}} are filled by the app.
+
+=====================================================================
+PART 1 - FLOW
+=====================================================================
+1. Per video: fill the per-video placeholders in the master prompt (PART 4), build the three catalogue blocks from the user's selection ONLY (PART 5), and send it first.
+   - API: use it as the system message on every call (stateless), or once at the start of a persistent chat.
+   - If it goes out as a chat message with no data attached, the model answers {"status":"READY"}. Ignore that reply.
+2. Per chunk: send the CHUNK MESSAGE (PART 2) -> parse the JSON -> store the clips.
+3. After all chunks: collect every MIGHT_BE clip. For each, build a validation window (PART 6) and send the VALIDATION MESSAGE (PART 3). Several clips can share one call.
+4. Apply the results:
+   - APPROVE: use corrected_start / corrected_end when they are not null, promote the clip to FOR_SURE, store its editing object.
+   - REJECT: drop it.
+   - NEEDS_MORE_CONTEXT: widen the window to requested_context, run again with round + 1. On the last round the model can only answer APPROVE or REJECT.
+5. FOR_SURE clips already carry their editing object from Stage 1. MIGHT_BE clips get theirs only on APPROVE, because their boundaries may still move.
+
+=====================================================================
+PART 2 - CHUNK MESSAGE TEMPLATE (user message, one per chunk)
+=====================================================================
+[CHUNK_DATA]
+video_id: {{VIDEO_ID}}
+chunk_id: {{CHUNK_ID}}
+chunk_index: {{CHUNK_INDEX}} of {{TOTAL_CHUNKS}}
+chunk_range_sec: {{CHUNK_START_SEC}} to {{CHUNK_END_SEC}}
+overlap_with_previous_sec: {{OVERLAP_PREV}}
+overlap_with_next_sec: {{OVERLAP_NEXT}}
+owned_clip_start_range_sec: {{OWNED_START_FROM_SEC}} to {{OWNED_START_UNTIL_SEC}}
+clip_id_prefix: {{CLIP_ID_PREFIX}}
+[SILENCE_INTERVALS]
+{{SILENCE_INTERVALS}}
+[/SILENCE_INTERVALS]
+[TRANSCRIPT]
+{{TRANSCRIPT}}
+[/TRANSCRIPT]
+[/CHUNK_DATA]
+
+Reply with the Stage 1 JSON object only.
+
+=====================================================================
+PART 3 - VALIDATION MESSAGE TEMPLATE (user message, one per batch of MIGHT_BE clips)
+=====================================================================
+[VALIDATION_DATA]
+video_id: {{VIDEO_ID}}
+validation_id: {{VALIDATION_ID}}
+validation_round: {{VALIDATION_ROUND}} of {{MAX_VALIDATION_ROUNDS}}
+{{CLIP_BLOCKS}}
+[VALIDATION_CONTEXT]
+{{VALIDATION_CONTEXT}}
+[/VALIDATION_CONTEXT]
+[/VALIDATION_DATA]
+
+Reply with the Stage 2 JSON object only.
+
+Each entry in {{CLIP_BLOCKS}} (one per clip, in the order you want the results back):
+
+[CLIP_TO_VALIDATE]
+clip: {{CLIP_JSON}}
+window_range_sec: {{WINDOW_START_SEC}} to {{WINDOW_END_SEC}}
+[SILENCE_INTERVALS]
+{{WINDOW_SILENCE_INTERVALS}}
+[/SILENCE_INTERVALS]
+[TRANSCRIPT_WINDOW]
+{{WINDOW_TRANSCRIPT}}
+[/TRANSCRIPT_WINDOW]
+[/CLIP_TO_VALIDATE]
+
+=====================================================================
+PART 4 - PLACEHOLDER REFERENCE
+=====================================================================
+MASTER PROMPT (fill once per video)
+{{VIDEO_ID}}                  your internal id, e.g. video_001
+{{VIDEO_TITLE}}               the real video title (NOT_PROVIDED if missing) - feeds the title-prediction step
+{{VIDEO_DURATION_SEC}}        total length in seconds (NOT_PROVIDED if unknown)
+{{SHOW_CONTEXT}}              optional: show name, comedian/guests, running jokes, short notes on previous episodes or past incidents; NOT_PROVIDED if none
+{{MIN_CLIP_SEC}}              suggested default 15
+{{MAX_CLIP_SEC}}              suggested default 90
+{{MIN_SILENCE_SEC}}           suggested default 2.0 (the prompt never goes below 1.5)
+{{SELECTED_VISUAL_EFFECTS}}   JSON array of ONLY the visual effects the user selected, or the literal NONE_SELECTED
+{{SELECTED_SOUND_EFFECTS}}    same, for sound effects
+{{SELECTED_TRANSITIONS}}      same, for transitions
+
+CHUNK MESSAGE (fill per chunk)
+{{VIDEO_ID}}                  same id as above
+{{CHUNK_ID}}                  e.g. chunk_002
+{{CHUNK_INDEX}}, {{TOTAL_CHUNKS}}     e.g. 2 and 5
+{{CHUNK_START_SEC}}, {{CHUNK_END_SEC}}     absolute seconds
+{{OVERLAP_PREV}}              "1800.0 to 1860.0", or NONE for the first chunk
+{{OVERLAP_NEXT}}              "3600.0 to 3660.0", or NONE for the last chunk
+{{OWNED_START_FROM_SEC}}, {{OWNED_START_UNTIL_SEC}}     see PART 6
+{{CLIP_ID_PREFIX}}            clip_ + zero-padded chunk number + _ , e.g. clip_002_
+{{SILENCE_INTERVALS}}         JSON array (PART 5) or NONE_PROVIDED
+{{TRANSCRIPT}}                lines like [1800.00-1804.30] text, in ABSOLUTE seconds
+
+VALIDATION MESSAGE (fill per call)
+{{VALIDATION_ID}}             e.g. val_001
+{{VALIDATION_ROUND}}, {{MAX_VALIDATION_ROUNDS}}     e.g. 1 and 3
+{{CLIP_BLOCKS}}               one block (PART 3) per MIGHT_BE clip
+{{CLIP_JSON}}                 the Stage 1 clip object for that clip (you can drop its editing field)
+{{WINDOW_START_SEC}}, {{WINDOW_END_SEC}}     the window you built (PART 6)
+{{WINDOW_SILENCE_INTERVALS}}  silences inside the window, or NONE_PROVIDED
+{{WINDOW_TRANSCRIPT}}         transcript lines for the window, absolute seconds
+{{VALIDATION_CONTEXT}}        extra notes: summary of earlier episodes, your own notes, outcome of the previous round; NONE if empty
+
+=====================================================================
+PART 5 - CATALOGUE AND SILENCE BLOCK FORMATS
+=====================================================================
+Build each catalogue block by filtering your full effect library by what the user ticked. Never send the whole library. If nothing is ticked in a category, send the literal NONE_SELECTED.
+Send duration_sec for every sound effect: the 1.5-second freeze-frame rule depends on it. If it is null, the model treats the sound as CONTINUE and says so in note.
+
+{{SELECTED_VISUAL_EFFECTS}} example:
+[
+  {"effect_id":"VFX_ZOOM_PUNCH","name":"Punch Zoom","description":"Fast push-in on the speaker for emphasis on a punchline","type":"zoom","duration_sec":0.6},
+  {"effect_id":"VFX_SHAKE_HARD","name":"Hard Shake","description":"Short camera shake for shock beats","type":"shake","duration_sec":0.4}
+]
+
+{{SELECTED_SOUND_EFFECTS}} example:
+[
+  {"effect_id":"SFX_RIMSHOT","name":"Rimshot","description":"Ba-dum-tss sting for a clean punchline","type":"sting","duration_sec":1.2},
+  {"effect_id":"SFX_RECORD_SCRATCH","name":"Record Scratch","description":"Scratch that stops the room, for a shocking reveal","type":"impact","duration_sec":2.0}
+]
+
+{{SELECTED_TRANSITIONS}} example:
+[
+  {"effect_id":"TRN_QUICK_FADE","name":"Quick Fade","description":"Short fade that smooths a cut","type":"fade","duration_sec":0.5}
+]
+
+{{SILENCE_INTERVALS}} example (from your audio analysis; ids unique per video, times absolute):
+[
+  {"silence_id":"sil_0042","start":2430.5,"end":2432.7,"duration":2.2}
+]
+Only send intervals with duration >= MIN_SILENCE_SEC that fall inside the chunk (or window). It saves tokens, and the model ignores shorter ones anyway.
+
+=====================================================================
+PART 6 - CHUNK MATH AND VALIDATION WINDOWS
+=====================================================================
+Chunking (30 min core, 1 min overlap):
+  S_1 = 0, S_(k+1) = S_k + 1800, E_k = min(S_k + 1860, video end)
+  overlap with next     = [S_(k+1), E_k]
+  overlap with previous = [S_k, E_(k-1)]
+
+Ownership (stops the same clip being reported by two chunks):
+  owned_from  = 0 for chunk 1, else midpoint of the overlap with the previous chunk = (S_k + E_(k-1)) / 2
+  owned_until = video end for the last chunk, else midpoint of the overlap with the next chunk = (S_(k+1) + E_k) / 2
+  Example: chunk 2 = 1800.0 to 3660.0, owned 1830.0 to 3630.0.
+  A clip may START only inside the owned range, but it can END in the overlap, which is what gives it the extra lookahead.
+
+Transcript times must be ABSOLUTE seconds. If your speech-to-text returns chunk-relative times, add the chunk start before sending. If it returns HH:MM:SS, convert to seconds (or edit SECTION 12.3 of the master prompt to match).
+
+Validation window (built from the full merged transcript):
+  default = [clip.start - 120, clip.end + 120], clamped to [0, video end]
+  on NEEDS_MORE_CONTEXT = union of the current window and requested_context
+  suggested MAX_VALIDATION_ROUNDS = 3; after that, send the clip to manual review.
+
+=====================================================================
+PART 7 - PARSE-TIME GUARDS (models slip on numbers and formatting)
+=====================================================================
+1. Trim whitespace and any BOM. If JSON.parse fails (for example the model added a code fence), take the text from the first { to the last } and try again. If it still fails, retry once with: "Your last reply was not a single valid JSON object. Resend it as plain JSON only."
+2. Recompute duration = end - start yourself and overwrite the model's value. Reject clips whose start is outside owned_clip_start_range_sec, whose end is past the chunk end, or that overlap another clip in the same reply.
+3. Treat any clip with status FOR_SURE but needs_validation true (or non-empty context_flags) as MIGHT_BE.
+4. Drop any editing item whose effect_id is not in the catalogue you sent, and any silence_id you did not send. Take duration from your catalogue, not from the reply.
+5. Re-derive silence cuts: remove_start = silence.start + 0.5 and remove_end = silence.end - 0.5 (small tolerance). Ignore the model's numbers if they differ.
+6. Re-check the freeze rule: catalogue duration_sec > 1.5 means FREEZE_FRAME with freeze_frame_recommended true; for FREEZE_FRAME items start must equal end, and the hold length is the longest duration in the sync_group.
+7. Cross-chunk safety net: if two clips from neighbouring chunks overlap by more than half, keep the FOR_SURE (or longer) one.
+8. If you use OpenAI JSON mode or structured outputs, keep this prompt as it is; the schema is null-friendly.

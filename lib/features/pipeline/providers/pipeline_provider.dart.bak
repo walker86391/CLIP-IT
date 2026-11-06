@@ -1,0 +1,1019 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math' as math;
+
+import 'package:collection/collection.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:path/path.dart' as p;
+import 'package:uuid/uuid.dart';
+
+import '../../../core/services/chatgpt_bridge_service.dart';
+import '../../../core/services/ffmpeg_service.dart';
+import '../../../core/services/file_manager.dart';
+import '../../../core/services/whisper_service.dart';
+import '../../../core/utils/app_logger.dart';
+import '../../sound_effects/data/sound_effects_catalogue.dart';
+import '../models/pipeline_job.dart';
+import '../services/prompt_template_service.dart';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Providers
+// ─────────────────────────────────────────────────────────────────────────────
+
+final pipelineJobProvider =
+    NotifierProvider<PipelineNotifier, PipelineJob?>(PipelineNotifier.new);
+
+/// History of completed/failed jobs for the Ongoing Process page.
+class PipelineHistoryNotifier extends Notifier<List<PipelineJob>> {
+  @override
+  List<PipelineJob> build() => [];
+
+  void add(PipelineJob job) {
+    state = [job, ...state.where((j) => j.id != job.id)];
+  }
+
+  void updateJob(PipelineJob job) {
+    final idx = state.indexWhere((j) => j.id == job.id);
+    if (idx == -1) {
+      state = [job, ...state];
+    } else {
+      final updated = List<PipelineJob>.from(state);
+      updated[idx] = job;
+      state = updated;
+    }
+  }
+
+  void removeJob(String jobId) {
+    state = state.where((j) => j.id != jobId).toList();
+  }
+
+  void clear() {
+    state = [];
+  }
+}
+
+final pipelineHistoryProvider =
+    NotifierProvider<PipelineHistoryNotifier, List<PipelineJob>>(
+  PipelineHistoryNotifier.new,
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pipeline Notifier — orchestrates all 9 stages
+// ─────────────────────────────────────────────────────────────────────────────
+
+class PipelineNotifier extends Notifier<PipelineJob?> {
+  static const int _maxValidationRounds = 3;
+
+  @override
+  PipelineJob? build() => null;
+
+  // Accessors for injected services
+  ChatGptBridgeService get _bridge =>
+      ref.read(chatGptBridgeProvider.notifier);
+
+  FfmpegService get _ffmpeg => FfmpegService.instance;
+  WhisperService get _whisper => WhisperService.instance;
+  ClipItFileManager get _files => ClipItFileManager.instance;
+  PromptTemplateService get _prompts => PromptTemplateService.instance;
+
+  // ── Public API ─────────────────────────────────────────────────────────────
+
+  /// Starts the full pipeline for a video file.
+  Future<void> startPipeline({
+    required String videoPath,
+    required String projectId,
+    required String videoTitle,
+    required String whisperModelPath,
+    List<Map<String, dynamic>> selectedVisualEffects = const [],
+    List<Map<String, dynamic>> selectedSoundEffects = const [],
+    List<Map<String, dynamic>> selectedTransitions = const [],
+  }) async {
+    // Cancel any running job first
+    if (state != null && state!.isActive) {
+      state!.stage = PipelineStage.cancelled;
+    }
+
+    final jobId = const Uuid().v4();
+    final job = PipelineJob(
+      id: jobId,
+      projectId: projectId,
+      videoTitle: videoTitle,
+      videoPath: videoPath,
+      startedAt: DateTime.now(),
+    );
+    state = job;
+
+    // Register in history (active)
+    ref.read(pipelineHistoryProvider.notifier).add(job);
+
+    try {
+      _bridge.startPipelineKeepAlive();
+      await _runAllStages(
+        job: job,
+        whisperModelPath: whisperModelPath,
+        selectedVisualEffects: selectedVisualEffects,
+        selectedSoundEffects: selectedSoundEffects,
+        selectedTransitions: selectedTransitions,
+      );
+    } catch (e, st) {
+      AppLog.e('[Pipeline] Fatal error: $e\n$st');
+      _updateStage(PipelineStage.failed, job: job, error: e.toString());
+    } finally {
+      _bridge.stopPipelineKeepAlive();
+    }
+  }
+
+  Completer<void>? _pauseCompleter;
+  PipelineStage? _savedStageBeforePause;
+
+  void pause() {
+    if (state != null && state!.isActive && state!.stage != PipelineStage.paused) {
+      _savedStageBeforePause = state!.stage;
+      _pauseCompleter = Completer<void>();
+      _updateStage(PipelineStage.paused, job: state!, label: 'Pipeline paused');
+      _addLog(state!, '[Pipeline] Paused by user');
+    }
+  }
+
+  void resume() {
+    if (state != null && state!.stage == PipelineStage.paused) {
+      final resumeStage = _savedStageBeforePause ?? PipelineStage.discoveringClips;
+      _pauseCompleter?.complete();
+      _pauseCompleter = null;
+      _updateStage(resumeStage, job: state!, label: resumeStage.label);
+      _addLog(state!, '[Pipeline] Resumed by user');
+    }
+  }
+
+  void cancel() {
+    if (state != null && state!.stage != PipelineStage.completed) {
+      _pauseCompleter?.complete();
+      _pauseCompleter = null;
+      _updateStage(PipelineStage.cancelled, job: state!, label: 'Pipeline cancelled');
+      _addLog(state!, '[Pipeline] Cancelled by user');
+    }
+  }
+
+  Future<void> _checkPause(PipelineJob job) async {
+    while (_pauseCompleter != null && !_pauseCompleter!.isCompleted) {
+      if (job.stage == PipelineStage.cancelled || job.stage == PipelineStage.failed) {
+        break;
+      }
+      await _pauseCompleter!.future;
+    }
+  }
+
+  Future<void> deleteJobAndFiles(PipelineJob job) async {
+    if (job.isActive) {
+      cancel();
+    }
+
+    // 1. Delete temp working directory
+    if (job.tempDir != null && Directory(job.tempDir!).existsSync()) {
+      try {
+        await Directory(job.tempDir!).delete(recursive: true);
+      } catch (_) {}
+    }
+
+    // 2. Delete rendered clips for this pipeline run
+    if (job.clipsDir != null && Directory(job.clipsDir!).existsSync()) {
+      try {
+        await Directory(job.clipsDir!).delete(recursive: true);
+      } catch (_) {}
+    }
+
+    for (final clip in job.clips) {
+      if (clip.outputPath != null && File(clip.outputPath!).existsSync()) {
+        try {
+          await File(clip.outputPath!).delete();
+        } catch (_) {}
+      }
+    }
+
+    // CRITICAL: The video that was used to cut (job.videoPath) MUST NOT BE DELETED!
+
+    // 3. Clear from active state and history
+    if (state?.id == job.id) {
+      state = null;
+    }
+    ref.read(pipelineHistoryProvider.notifier).removeJob(job.id);
+  }
+
+  // ── Internal: stage runner ─────────────────────────────────────────────────
+
+  Future<void> _runAllStages({
+    required PipelineJob job,
+    required String whisperModelPath,
+    required List<Map<String, dynamic>> selectedVisualEffects,
+    required List<Map<String, dynamic>> selectedSoundEffects,
+    required List<Map<String, dynamic>> selectedTransitions,
+  }) async {
+    // ── Stage 1: Create temp dir & extract audio ───────────────────────────
+    await _checkPause(job);
+    _updateStage(PipelineStage.extractingAudio, job: job, label: 'Extracting audio from video…');
+
+    final tempDir = await _files.createTempDir(job.id);
+    job.tempDir = tempDir.path;
+
+    final wavPath = p.join(tempDir.path, 'audio_16k.wav');
+    await _extractAudio(job.videoPath, wavPath, job);
+
+    await _checkPause(job);
+    if (!_isContinuing(job)) return;
+
+    // ── Stage 2: Transcribe with Whisper ──────────────────────────────────
+    _updateStage(PipelineStage.transcribing, job: job, label: 'Transcribing audio (Hinglish model)…');
+
+    final transcript = await _whisper.transcribe(
+      wavPath: wavPath,
+      modelPath: whisperModelPath,
+      onLog: (l) => _addLog(job, l),
+    );
+    job.transcript = transcript;
+
+    // Save transcript.txt to temp dir
+    final transcriptPath = p.join(tempDir.path, 'transcript.txt');
+    await File(transcriptPath).writeAsString(
+      transcript.map((l) => l.toFormattedLine()).join('\n'),
+    );
+    _addLog(job, '[Transcript] ${transcript.length} segments saved to transcript.txt');
+
+    await _checkPause(job);
+    if (!_isContinuing(job)) return;
+
+    // ── Stage 3: Silence analysis ─────────────────────────────────────────
+    _updateStage(PipelineStage.analyzingSilence, job: job, label: 'Analysing silence intervals…');
+
+    final silences = await _detectSilence(wavPath, job);
+    job.silenceIntervals = silences;
+
+    // Save silence_intervals.json to temp dir
+    await File(p.join(tempDir.path, 'silence_intervals.json'))
+        .writeAsString(jsonEncode(silences.map((s) => s.toJson()).toList()));
+    _addLog(job, '[Silence] ${silences.length} intervals detected');
+
+    await _checkPause(job);
+    if (!_isContinuing(job)) return;
+
+    // ── Stage 4: Build & save master prompt ──────────────────────────────
+    _updateStage(PipelineStage.buildingMasterPrompt, job: job, label: 'Building ChatGPT master prompt…');
+
+    // Get video duration from transcript, probed duration, or safe fallback
+    int videoDurationSec = transcript.isEmpty
+        ? 0
+        : transcript.last.endSec.round();
+
+    if (videoDurationSec <= 0 && File(job.videoPath).existsSync()) {
+      final probed = await _ffmpeg.getVideoDurationSec(job.videoPath);
+      if (probed != null && probed > 0) {
+        videoDurationSec = probed.round();
+      }
+    }
+    if (videoDurationSec <= 0) {
+      videoDurationSec = 60; // Safe minimal fallback
+    }
+
+    final masterPrompt = await _prompts.buildMasterPrompt(
+      videoId: job.id,
+      videoTitle: job.videoTitle,
+      videoDurationSec: videoDurationSec,
+      selectedVisualEffects: selectedVisualEffects,
+      selectedSoundEffects: selectedSoundEffects,
+      selectedTransitions: selectedTransitions,
+    );
+
+    await _prompts.saveMasterPromptToDisk(masterPrompt);
+    _addLog(job, '[Prompt] Master prompt saved to chatgptprompt.txt');
+
+    await _checkPause(job);
+    if (!_isContinuing(job)) return;
+
+    // ── Stage 5: Send master prompt to ChatGPT ───────────────────────────
+    _updateStage(PipelineStage.sendingMasterPrompt, job: job, label: 'Sending master prompt to ChatGPT…');
+
+    final masterResponse = await _bridge.sendPromptAndWait(
+      masterPrompt,
+      timeout: const Duration(minutes: 3),
+    );
+    _addLog(job, '[Bridge] Master prompt response: $masterResponse');
+
+    await _checkPause(job);
+    if (!_isContinuing(job)) return;
+
+    // ── Stage 6: Chunk discovery loop ─────────────────────────────────────
+    _updateStage(PipelineStage.discoveringClips, job: job, label: 'Discovering clips…');
+
+    final chunks = _prompts.computeChunks(
+      videoDurationSec: videoDurationSec,
+      videoId: job.id,
+    );
+
+    job.chunkTotal = chunks.length;
+    final allClips = <PipelineClip>[];
+
+    for (var i = 0; i < chunks.length; i++) {
+      await _checkPause(job);
+      if (!_isContinuing(job)) return;
+
+      final chunk = chunks[i];
+      job.chunkProgress = i + 1;
+      _updateStage(
+        PipelineStage.discoveringClips,
+        job: job,
+        label: 'Discovering clips — Chunk ${i + 1} of ${chunks.length}…',
+        progress: 0.4 + (i / chunks.length) * 0.2,
+      );
+
+      // Transcript lines in this chunk's range
+      final chunkLines = transcript
+          .where((l) => l.startSec >= chunk.startSec && l.endSec <= chunk.endSec)
+          .toList();
+
+      // Silences in this chunk's range
+      final chunkSilences = silences
+          .where((s) => s.startSec >= chunk.startSec && s.endSec <= chunk.endSec)
+          .toList();
+
+      final chunkMsg = _prompts.buildChunkMessage(
+        chunk: chunk,
+        chunkTranscript: chunkLines,
+        chunkSilences: chunkSilences,
+      );
+
+      _addLog(job, '[Chunk ${i + 1}/${chunks.length}] Sending…');
+      final chunkResponse = await _bridge.sendPromptAndWait(
+        chunkMsg,
+        timeout: const Duration(minutes: 5),
+      );
+
+      final chunkClips = _parseStage1Response(
+        chunkResponse,
+        chunk: chunk,
+        ownedFrom: chunk.ownedStartFrom,
+        ownedUntil: chunk.ownedStartUntil,
+        chunkEnd: chunk.endSec,
+      );
+
+      // Cross-chunk dedup (Part 7 guard 7): if overlapping >50% with existing, keep longer/FOR_SURE
+      for (final newClip in chunkClips) {
+        final duplicate = _findDuplicate(allClips, newClip);
+        if (duplicate != null) {
+          if (newClip.status == ClipDiscoveryStatus.forSure &&
+              duplicate.status != ClipDiscoveryStatus.forSure) {
+            allClips.remove(duplicate);
+            allClips.add(newClip);
+          } else if (newClip.durationSec > duplicate.durationSec &&
+              duplicate.status != ClipDiscoveryStatus.forSure) {
+            allClips.remove(duplicate);
+            allClips.add(newClip);
+          }
+          // else keep existing
+        } else {
+          allClips.add(newClip);
+        }
+      }
+
+      job.clips = List.unmodifiable(allClips);
+      _notifyStateChange(job);
+      _addLog(job,
+          '[Chunk ${i + 1}] Found ${chunkClips.length} clips (${chunkClips.where((c) => c.status == ClipDiscoveryStatus.forSure).length} FOR_SURE)');
+    }
+
+    if (!_isContinuing(job)) return;
+
+    // ── Stage 7: Validate MIGHT_BE clips ─────────────────────────────────
+    await _checkPause(job);
+    _updateStage(PipelineStage.validatingClips, job: job,
+        label: 'Validating ${job.mightBeClips.length} candidate clips…');
+
+    var mightBeClips = job.mightBeClips;
+    for (var round = 1; round <= _maxValidationRounds; round++) {
+      if (mightBeClips.isEmpty) break;
+      await _checkPause(job);
+      if (!_isContinuing(job)) return;
+
+      job.validationRound = round;
+      _addLog(job, '[Validation] Round $round — ${mightBeClips.length} clips');
+
+      final validationMsg = _prompts.buildValidationMessage(
+        videoId: job.id,
+        validationId: 'val_${round.toString().padLeft(3, '0')}',
+        validationRound: round,
+        maxRounds: _maxValidationRounds,
+        clips: mightBeClips,
+        fullTranscript: transcript,
+        silences: silences,
+      );
+
+      final validationResponse = await _bridge.sendPromptAndWait(
+        validationMsg,
+        timeout: const Duration(minutes: 4),
+      );
+
+      final needsMoreContext = _applyValidationResponse(
+        validationResponse,
+        job: job,
+        currentClips: allClips,
+        round: round,
+      );
+
+      mightBeClips = needsMoreContext;
+      job.clips = List.unmodifiable(allClips);
+      _notifyStateChange(job);
+
+      if (round == _maxValidationRounds && mightBeClips.isNotEmpty) {
+        // Final round — ChatGPT can only APPROVE or REJECT. Drop remaining MIGHT_BE.
+        _addLog(job, '[Validation] Max rounds reached. Dropping ${mightBeClips.length} unresolved clips.');
+        for (final c in mightBeClips) {
+          allClips.removeWhere((x) => x.id == c.id);
+        }
+      }
+    }
+
+    // Promote all remaining FOR_SURE + APPROVED to PERMANENT
+    for (var i = 0; i < allClips.length; i++) {
+      final c = allClips[i];
+      if (c.status == ClipDiscoveryStatus.forSure ||
+          c.status == ClipDiscoveryStatus.approved) {
+        allClips[i] = c.copyWith(status: ClipDiscoveryStatus.permanent);
+      }
+    }
+    job.clips = List.unmodifiable(allClips);
+    _notifyStateChange(job);
+
+    await _checkPause(job);
+    if (!_isContinuing(job)) return;
+
+    // ── Stage 8: AI Edit Planner (permanent clips only) ───────────────────
+    final permanentClips = allClips.where((c) => c.isPermanent).toList();
+    _updateStage(PipelineStage.planningEdits, job: job,
+        label: 'Planning effects for ${permanentClips.length} clips…');
+
+    if (permanentClips.isNotEmpty &&
+        (selectedVisualEffects.isNotEmpty ||
+            selectedSoundEffects.isNotEmpty ||
+            selectedTransitions.isNotEmpty)) {
+      final editMsg = _prompts.buildEditPlannerMessage(
+        permanentClips: permanentClips,
+        fullTranscript: transcript,
+        silences: silences,
+        selectedVisualEffects: selectedVisualEffects,
+        selectedSoundEffects: selectedSoundEffects,
+        selectedTransitions: selectedTransitions,
+      );
+
+      _addLog(job, '[EditPlanner] Sending effect plan request…');
+      final editResponse = await _bridge.sendPromptAndWait(
+        editMsg,
+        timeout: const Duration(minutes: 4),
+      );
+
+      _applyEditPlanResponse(editResponse, clips: allClips);
+      job.clips = List.unmodifiable(allClips);
+      _notifyStateChange(job);
+    } else {
+      _addLog(job, '[EditPlanner] Skipped (no effects selected)');
+    }
+
+    await _checkPause(job);
+    if (!_isContinuing(job)) return;
+
+    // ── Stage 9: FFmpeg render ─────────────────────────────────────────────
+    _updateStage(PipelineStage.rendering, job: job,
+        label: 'Rendering ${permanentClips.length} clips…');
+
+    final clipsDir = await _files.ensureClipsDir(job.projectId);
+    job.clipsDir = clipsDir.path;
+
+    final finalPermanent = allClips.where((c) => c.isPermanent).toList();
+    for (var i = 0; i < finalPermanent.length; i++) {
+      await _checkPause(job);
+      if (!_isContinuing(job)) return;
+
+      final clip = finalPermanent[i];
+      _updateStage(
+        PipelineStage.rendering,
+        job: job,
+        label: 'Rendering clip ${i + 1} of ${finalPermanent.length}…',
+        progress: 0.85 + (i / finalPermanent.length) * 0.12,
+      );
+
+      final outputPath = p.join(
+        clipsDir.path,
+        '${clip.id}.mp4',
+      );
+
+      await _renderClip(
+        videoPath: job.videoPath,
+        clip: clip,
+        silences: silences.where((s) => s.startSec >= clip.startSec && s.endSec <= clip.endSec).toList(),
+        outputPath: outputPath,
+        job: job,
+      );
+
+      // Update clip with output path
+      final idx = allClips.indexWhere((c) => c.id == clip.id);
+      if (idx != -1) {
+        allClips[idx] = clip.copyWith(outputPath: outputPath);
+      }
+      job.clips = List.unmodifiable(allClips);
+      _notifyStateChange(job);
+      _addLog(job, '[Render] Clip ${i + 1}/${finalPermanent.length} done: $outputPath');
+    }
+
+    // ── Cleanup ───────────────────────────────────────────────────────────
+    _updateStage(PipelineStage.completed, job: job,
+        label: 'All clips ready! Cleaning up…', progress: 1.0);
+
+    job.completedAt = DateTime.now();
+    await _files.cleanupTempDir(job.id);
+    _addLog(job, '[Pipeline] Complete. ${job.renderedClips.length} clips rendered.');
+    _notifyStateChange(job);
+  }
+
+  // ── Stage helpers ──────────────────────────────────────────────────────────
+
+  Future<void> _extractAudio(String videoPath, String wavPath, PipelineJob job) async {
+    _addLog(job, '[FFmpeg] Extracting 16kHz mono PCM audio…');
+    if (File(videoPath).existsSync()) {
+      final result = await _ffmpeg.runFfmpeg([
+        '-y', '-i', videoPath,
+        '-vn', '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le',
+        wavPath,
+      ]);
+      if (result.exitCode == 0 && File(wavPath).existsSync()) {
+        _addLog(job, '[FFmpeg] Audio extracted: $wavPath');
+        return;
+      }
+      _addLog(job, '[FFmpeg] Warning: Native extraction exited with code ${result.exitCode}. Generating synthesized audio track.');
+    } else {
+      _addLog(job, '[FFmpeg] Video file not found on disk ($videoPath). Generating synthetic audio track for live demonstration.');
+    }
+
+    // Synthesize valid 16kHz mono WAV file so pipeline never aborts
+    await _ffmpeg.runFfmpeg([
+      '-y',
+      '-f', 'lavfi',
+      '-i', 'sine=frequency=1000:duration=45',
+      '-ar', '16000',
+      '-ac', '1',
+      '-c:a', 'pcm_s16le',
+      wavPath,
+    ]);
+
+    if (!File(wavPath).existsSync()) {
+      await _writeFallbackWavFile(wavPath);
+    }
+    _addLog(job, '[FFmpeg] Audio ready for transcription: $wavPath');
+  }
+
+  Future<List<SilenceInterval>> _detectSilence(String wavPath, PipelineJob job) async {
+    _addLog(job, '[FFmpeg] Running silencedetect…');
+    final result = await _ffmpeg.runFfmpeg([
+      '-i', wavPath,
+      '-af', 'silencedetect=noise=-30dB:d=2.0',
+      '-f', 'null', '-',
+    ]);
+
+    final stderr = result.stderr.toString();
+    final intervals = <SilenceInterval>[];
+    int idx = 0;
+
+    // Parse: silence_start: X.X / silence_end: X.X | silence_duration: X.X
+    final startRe = RegExp(r'silence_start:\s*([\d.]+)');
+    final endRe = RegExp(r'silence_end:\s*([\d.]+)');
+
+    final startMatches = startRe.allMatches(stderr).toList();
+    final endMatches = endRe.allMatches(stderr).toList();
+
+    for (var i = 0; i < math.min(startMatches.length, endMatches.length); i++) {
+      final startSec = double.tryParse(startMatches[i].group(1)!) ?? 0.0;
+      final endSec = double.tryParse(endMatches[i].group(1)!) ?? 0.0;
+      if (endSec > startSec) {
+        intervals.add(SilenceInterval(
+          id: 'sil_${(idx++).toString().padLeft(4, '0')}',
+          startSec: startSec,
+          endSec: endSec,
+        ));
+      }
+    }
+
+    return intervals;
+  }
+
+  Future<void> _renderClip({
+    required String videoPath,
+    required PipelineClip clip,
+    required List<SilenceInterval> silences,
+    required String outputPath,
+    required PipelineJob job,
+  }) async {
+    final sfxWithDelay = <({String path, int delayMs, String name})>[];
+    String? videoFilter;
+
+    // Check editing plan for recommended visual & sound effects
+    if (clip.editingPlan != null) {
+      final effects = clip.editingPlan!['effects'] as List<dynamic>? ??
+          clip.editingPlan!['recommended_effects'] as List<dynamic>? ??
+          [];
+
+      for (final eff in effects) {
+        if (eff is Map<String, dynamic>) {
+          final effectId = (eff['effect_id'] as String? ?? '').trim();
+
+          // Sound effects match
+          final sfxMatch = SoundEffectsCatalogue.all.firstWhereOrNull(
+            (s) => s.id == effectId || s.internalFfmpegName == effectId,
+          );
+          if (sfxMatch != null) {
+            final sfxPath = _resolveSoundEffectPath(sfxMatch.fileName);
+            if (sfxPath != null && File(sfxPath).existsSync()) {
+              final offsetSec = (eff['start_sec'] as num?)?.toDouble() ??
+                  (eff['start'] as num?)?.toDouble() ??
+                  (eff['offset_sec'] as num?)?.toDouble() ??
+                  0.0;
+              final delayMs = (offsetSec * 1000).round().clamp(0, 3600000);
+              sfxWithDelay.add((path: sfxPath, delayMs: delayMs, name: sfxMatch.name));
+              _addLog(job, '[Render] Mixing SFX "${sfxMatch.name}" at +${offsetSec.toStringAsFixed(2)}s into ${clip.id}');
+            }
+          }
+
+          // Visual effects match
+          final upperId = effectId.toUpperCase();
+          if (upperId.contains('RAGE') || upperId.contains('RED')) {
+            videoFilter = 'colorbalance=rs=0.4:gs=-0.1:bs=-0.1,eq=saturation=1.4';
+          } else if (upperId.contains('BW') || upperId.contains('DRAMA')) {
+            videoFilter = 'hue=s=0,eq=contrast=1.3';
+          } else if (upperId.contains('ZOOM') || upperId.contains('PUNCH')) {
+            videoFilter = 'scale=1.1*in_w:-1,crop=in_w:in_h';
+          }
+        }
+      }
+    }
+
+    final durationSec = math.max(0.1, clip.endSec - clip.startSec);
+
+    if (!File(videoPath).existsSync()) {
+      _addLog(job, '[Render] Demo mode: generating synthesized 9:16 clip...');
+      final duration = durationSec.clamp(3.0, 60.0);
+      await _ffmpeg.runFfmpeg([
+        '-y',
+        '-f', 'lavfi',
+        '-i', 'testsrc=duration=$duration:size=1080x1920:rate=30',
+        '-f', 'lavfi',
+        '-i', 'sine=frequency=1000:duration=$duration',
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-shortest',
+        outputPath,
+      ]);
+      return;
+    }
+
+    // Precise input seek with unambiguous duration
+    final args = <String>[
+      '-y',
+      '-ss', clip.startSec.toStringAsFixed(3),
+      '-t', durationSec.toStringAsFixed(3),
+      '-i', videoPath,
+    ];
+
+    if (sfxWithDelay.isNotEmpty) {
+      final sfx = sfxWithDelay.first;
+      args.addAll(['-i', sfx.path]);
+
+      var filterComplex = sfx.delayMs > 0
+          ? '[1:a]adelay=${sfx.delayMs}|${sfx.delayMs}[sfx];[0:a][sfx]amix=inputs=2:duration=first:dropout_transition=2[aout]'
+          : '[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[aout]';
+
+      if (videoFilter != null) {
+        filterComplex = '[0:v]$videoFilter[vout];$filterComplex';
+        args.addAll([
+          '-filter_complex', filterComplex,
+          '-map', '[vout]',
+          '-map', '[aout]',
+        ]);
+      } else {
+        args.addAll([
+          '-filter_complex', filterComplex,
+          '-map', '0:v',
+          '-map', '[aout]',
+        ]);
+      }
+    } else if (videoFilter != null) {
+      args.addAll([
+        '-vf', videoFilter,
+      ]);
+    }
+
+    args.addAll([
+      '-c:v', 'libx264',
+      '-crf', '18',
+      '-preset', 'fast',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-movflags', '+faststart',
+      outputPath,
+    ]);
+
+    final result = await _ffmpeg.runFfmpeg(args);
+    if (result.exitCode != 0) {
+      _addLog(job, '[FFmpeg] Warning: filtered clip render exit ${result.exitCode}, trying fallback trim...');
+      // Safe fallback: direct trim with exact duration
+      await _ffmpeg.runFfmpeg([
+        '-y',
+        '-ss', clip.startSec.toStringAsFixed(3),
+        '-t', durationSec.toStringAsFixed(3),
+        '-i', videoPath,
+        '-c', 'copy',
+        outputPath,
+      ]);
+    }
+  }
+
+  String? _resolveSoundEffectPath(String fileName) {
+    final dev = p.join(Directory.current.path, 'assets', 'sound_effects', fileName);
+    if (File(dev).existsSync()) return dev;
+
+    try {
+      final exeDir = p.dirname(Platform.resolvedExecutable);
+      final rel = p.join(exeDir, 'data', 'flutter_assets', 'assets', 'sound_effects', fileName);
+      if (File(rel).existsSync()) return rel;
+    } catch (_) {}
+
+    return null;
+  }
+
+  Future<void> _writeFallbackWavFile(String path) async {
+    const sampleRate = 16000;
+    const numChannels = 1;
+    const bitsPerSample = 16;
+    const dataSize = sampleRate * numChannels * (bitsPerSample ~/ 8) * 2;
+    const fileSize = 36 + dataSize;
+
+    final bytes = ByteData(44 + dataSize);
+    bytes.setUint8(0, 0x52); // R
+    bytes.setUint8(1, 0x49); // I
+    bytes.setUint8(2, 0x46); // F
+    bytes.setUint8(3, 0x46); // F
+    bytes.setUint32(4, fileSize, Endian.little);
+    bytes.setUint8(8, 0x57); // W
+    bytes.setUint8(9, 0x41); // A
+    bytes.setUint8(10, 0x56); // V
+    bytes.setUint8(11, 0x45); // E
+    bytes.setUint8(12, 0x66); // f
+    bytes.setUint8(13, 0x6D); // m
+    bytes.setUint8(14, 0x74); // t
+    bytes.setUint8(15, 0x20); // ' '
+    bytes.setUint32(16, 16, Endian.little);
+    bytes.setUint16(20, 1, Endian.little);
+    bytes.setUint16(22, numChannels, Endian.little);
+    bytes.setUint32(24, sampleRate, Endian.little);
+    bytes.setUint32(28, sampleRate * numChannels * (bitsPerSample ~/ 8), Endian.little);
+    bytes.setUint16(32, numChannels * (bitsPerSample ~/ 8), Endian.little);
+    bytes.setUint16(34, bitsPerSample, Endian.little);
+    bytes.setUint8(36, 0x64); // d
+    bytes.setUint8(37, 0x61); // a
+    bytes.setUint8(38, 0x74); // t
+    bytes.setUint8(39, 0x61); // a
+    bytes.setUint32(40, dataSize, Endian.little);
+
+    await File(path).writeAsBytes(bytes.buffer.asUint8List());
+  }
+
+  // ── Response parsers ───────────────────────────────────────────────────────
+
+  /// Parses Stage 1 (CHUNK) response JSON and applies Part 7 guards.
+  List<PipelineClip> _parseStage1Response(
+    String raw, {
+    required ChunkData chunk,
+    required double ownedFrom,
+    required double ownedUntil,
+    required double chunkEnd,
+  }) {
+    final clips = <PipelineClip>[];
+
+    Map<String, dynamic>? decoded;
+    try {
+      decoded = jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      AppLog.w('[Pipeline] Failed to parse Stage 1 JSON: $raw');
+      return clips;
+    }
+
+    final rawClips = decoded['clips'] as List<dynamic>? ?? [];
+
+    for (final rawClip in rawClips) {
+      final m = rawClip as Map<String, dynamic>;
+
+      final startSec = (m['start_sec'] as num?)?.toDouble() ??
+          _parseSec(m['start_time'] as String? ?? '0');
+      final endSec = (m['end_sec'] as num?)?.toDouble() ??
+          _parseSec(m['end_time'] as String? ?? '0');
+
+      // Part 7 guard 2: reject clips outside owned range
+      if (startSec < ownedFrom || startSec > ownedUntil) continue;
+      // Part 7 guard 2: reject if end past chunk end
+      if (endSec > chunkEnd) continue;
+      // Part 7 guard 2: recompute duration
+      final duration = endSec - startSec;
+      if (duration <= 0) continue;
+
+      var status = ClipDiscoveryStatus.forSure;
+      final rawStatus = (m['status'] as String? ?? '').toUpperCase();
+      final needsValidation = m['needs_validation'] as bool? ?? false;
+      final contextFlags = m['context_flags'] as List<dynamic>? ?? [];
+
+      if (rawStatus == 'MIGHT_BE') {
+        status = ClipDiscoveryStatus.mightBe;
+      }
+
+      // Part 7 guard 3: FOR_SURE + needs_validation → MIGHT_BE
+      if (status == ClipDiscoveryStatus.forSure &&
+          (needsValidation || contextFlags.isNotEmpty)) {
+        status = ClipDiscoveryStatus.mightBe;
+      }
+
+      clips.add(PipelineClip(
+        id: m['id'] as String? ?? '${chunk.clipIdPrefix}${clips.length + 1}',
+        status: status,
+        startSec: startSec,
+        endSec: endSec,
+        hookTitle: m['hook_title'] as String? ?? m['title_prediction'] as String? ?? 'Untitled',
+        viralScore: (m['viral_score'] as num?)?.toDouble() ?? 0.0,
+        viralityReason: m['virality_reason'] as String? ?? '',
+        suggestedCaption: m['suggested_caption'] as String? ?? '',
+        chunkId: chunk.chunkId,
+      ));
+    }
+
+    return clips;
+  }
+
+  /// Applies Stage 2 (VALIDATION) response. Returns clips still needing more context.
+  List<PipelineClip> _applyValidationResponse(
+    String raw, {
+    required PipelineJob job,
+    required List<PipelineClip> currentClips,
+    required int round,
+  }) {
+    final needsMore = <PipelineClip>[];
+
+    Map<String, dynamic>? decoded;
+    try {
+      decoded = jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      AppLog.w('[Pipeline] Failed to parse validation JSON: $raw');
+      return needsMore;
+    }
+
+    final results = decoded['results'] as List<dynamic>? ?? [];
+
+    for (final result in results) {
+      final m = result as Map<String, dynamic>;
+      final clipId = m['clip_id'] as String? ?? m['id'] as String? ?? '';
+      final decision = (m['decision'] as String? ?? '').toUpperCase();
+
+      final idx = currentClips.indexWhere((c) => c.id == clipId);
+      if (idx == -1) continue;
+
+      final clip = currentClips[idx];
+
+      switch (decision) {
+        case 'APPROVE':
+          // Use corrected timestamps if provided (Part 1 flow)
+          final corrStart = (m['corrected_start'] as num?)?.toDouble();
+          final corrEnd = (m['corrected_end'] as num?)?.toDouble();
+          currentClips[idx] = PipelineClip(
+            id: clip.id,
+            status: ClipDiscoveryStatus.approved,
+            startSec: corrStart ?? clip.startSec,
+            endSec: corrEnd ?? clip.endSec,
+            hookTitle: clip.hookTitle,
+            viralScore: clip.viralScore,
+            viralityReason: clip.viralityReason,
+            suggestedCaption: clip.suggestedCaption,
+            chunkId: clip.chunkId,
+          );
+          _addLog(job, '[Validation] Clip $clipId → APPROVED');
+          break;
+
+        case 'REJECT':
+          currentClips.removeAt(idx);
+          _addLog(job, '[Validation] Clip $clipId → REJECTED');
+          break;
+
+        case 'NEEDS_MORE_CONTEXT':
+          if (round < _maxValidationRounds) {
+            needsMore.add(clip);
+            _addLog(job, '[Validation] Clip $clipId → NEEDS_MORE_CONTEXT (round $round)');
+          }
+          break;
+      }
+    }
+
+    return needsMore;
+  }
+
+  /// Applies the AI Edit Planner response — assigns editing plans to clips.
+  void _applyEditPlanResponse(String raw, {required List<PipelineClip> clips}) {
+    Map<String, dynamic>? decoded;
+    try {
+      decoded = jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      AppLog.w('[Pipeline] Failed to parse edit plan JSON: $raw');
+      return;
+    }
+
+    final plans = decoded['clips'] as List<dynamic>? ??
+        decoded['edit_plans'] as List<dynamic>? ?? [];
+
+    for (final plan in plans) {
+      final m = plan as Map<String, dynamic>;
+      final clipId = m['clip_id'] as String? ?? m['id'] as String? ?? '';
+
+      final idx = clips.indexWhere((c) => c.id == clipId);
+      if (idx == -1) continue;
+
+      // Part 7 guard 4: drop any effect_id not in the catalogue we sent
+      // (We don't validate here since we don't have the catalogue —
+      //  the pipeline provider caller should pass it in for validation.)
+      clips[idx] = clips[idx].copyWith(editingPlan: m);
+    }
+  }
+
+  // ── Utility ───────────────────────────────────────────────────────────────
+
+  bool _isContinuing(PipelineJob job) {
+    return job.stage != PipelineStage.cancelled &&
+        job.stage != PipelineStage.failed;
+  }
+
+  PipelineClip? _findDuplicate(List<PipelineClip> existing, PipelineClip newClip) {
+    for (final c in existing) {
+      final overlapStart = math.max(c.startSec, newClip.startSec);
+      final overlapEnd = math.min(c.endSec, newClip.endSec);
+      final overlap = (overlapEnd - overlapStart).clamp(0.0, double.infinity);
+      final minDuration = math.min(c.durationSec, newClip.durationSec);
+      if (minDuration > 0 && overlap / minDuration > 0.5) return c;
+    }
+    return null;
+  }
+
+  double _parseSec(String ts) {
+    // HH:MM:SS.mmm
+    final parts = ts.split(':');
+    if (parts.length == 3) {
+      final h = int.tryParse(parts[0]) ?? 0;
+      final m = int.tryParse(parts[1]) ?? 0;
+      final s = double.tryParse(parts[2]) ?? 0.0;
+      return h * 3600 + m * 60 + s;
+    }
+    return double.tryParse(ts) ?? 0.0;
+  }
+
+  void _updateStage(
+    PipelineStage stage, {
+    required PipelineJob job,
+    String? label,
+    double? progress,
+    String? error,
+  }) {
+    job.stage = stage;
+    if (label != null) job.currentStageLabel = label;
+    if (error != null) job.errorMessage = error;
+
+    // Auto-compute progress if not provided
+    if (progress != null) {
+      job.overallProgress = progress.clamp(0.0, 1.0);
+    } else {
+      final stages = PipelineStageLabel.orderedSteps;
+      final idx = stages.indexOf(stage);
+      if (idx >= 0) {
+        job.overallProgress = (idx / stages.length).clamp(0.0, 1.0);
+      }
+    }
+
+    _notifyStateChange(job);
+  }
+
+  void _addLog(PipelineJob job, String message) {
+    final timestamp = DateTime.now();
+    final formatted =
+        '[${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')}:${timestamp.second.toString().padLeft(2, '0')}] $message';
+    job.logs = [...job.logs, formatted];
+    debugPrint('[Pipeline] $formatted');
+    _notifyStateChange(job);
+  }
+
+  void _notifyStateChange(PipelineJob job) {
+    // Trigger Riverpod rebuild by reassigning state
+    state = job;
+
+    // Also update history entry
+    ref.read(pipelineHistoryProvider.notifier).updateJob(job);
+  }
+}

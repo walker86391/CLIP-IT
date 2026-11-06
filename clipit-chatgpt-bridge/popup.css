@@ -1,0 +1,357 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+body {
+  width: 320px;
+  background-color: #0F1016;
+  color: #F8FAFC;
+  padding: 16px;
+  font-size: 13px;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logo-box {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #8B5CF6, #3B82F6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+}
+
+.title-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.title {
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: -0.2px;
+}
+
+.version {
+  font-size: 10px;
+  color: #94A3B8;
+}
+
+/* Header Controls: Dot next to On/Off Button */
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #6B7280;
+  box-shadow: 0 0 8px rgba(107, 114, 128, 0.5);
+  transition: all 0.3s ease;
+}
+
+.status-dot.connected {
+  background: #10B981;
+  box-shadow: 0 0 10px rgba(16, 185, 129, 0.8);
+}
+
+.status-dot.connecting {
+  background: #F59E0B;
+  box-shadow: 0 0 10px rgba(245, 158, 11, 0.8);
+  animation: pulse 1.2s infinite;
+}
+
+.status-dot.error {
+  background: #EF4444;
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.8);
+}
+
+.status-dot.off {
+  background: #374151;
+  box-shadow: none;
+}
+
+/* Sleek Pill Power On/Off Toggle Button */
+.power-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 54px;
+  height: 26px;
+  border-radius: 13px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  outline: none;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  padding: 2px;
+}
+
+.power-toggle.on {
+  background: linear-gradient(135deg, #10B981, #059669);
+  border-color: rgba(16, 185, 129, 0.6);
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.35);
+}
+
+.power-toggle.off {
+  background: #1F2430;
+  border-color: rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.5);
+}
+
+.power-knob {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #FFFFFF;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.power-toggle.on .power-knob {
+  transform: translateX(28px);
+}
+
+.power-toggle.off .power-knob {
+  transform: translateX(0px);
+  background: #94A3B8;
+}
+
+.power-text {
+  position: absolute;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  user-select: none;
+}
+
+.power-toggle.on .power-text {
+  left: 7px;
+  color: #FFFFFF;
+}
+
+.power-toggle.off .power-text {
+  right: 7px;
+  color: #64748B;
+}
+
+@keyframes pulse {
+  0% { transform: scale(0.9); opacity: 0.7; }
+  50% { transform: scale(1.2); opacity: 1; }
+  100% { transform: scale(0.9); opacity: 0.7; }
+}
+
+.status-container {
+  background: #171822;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.status-label {
+  font-size: 11px;
+  color: #94A3B8;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.status-badge {
+  display: inline-block;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 6px;
+  padding: 3px 0;
+}
+
+.status-badge.connected {
+  color: #10B981;
+}
+
+.status-badge.connecting {
+  color: #F59E0B;
+}
+
+.status-badge.disconnected, .status-badge.error {
+  color: #EF4444;
+}
+
+.status-badge.off {
+  color: #94A3B8;
+}
+
+.status-details {
+  font-size: 11px;
+  color: #64748B;
+  line-height: 1.4;
+}
+
+.port-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  color: #94A3B8;
+  padding: 4px 2px;
+}
+
+.port-info code {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: #C084FC;
+  font-family: monospace;
+}
+
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.platform-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(139, 92, 246, 0.2);
+  color: #C084FC;
+  border: 1px solid rgba(139, 92, 246, 0.4);
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.quick-launch-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94A3B8;
+}
+
+.launch-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.launch-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 7px;
+  color: #F1F5F9;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+
+.launch-btn:hover {
+  background: rgba(139, 92, 246, 0.16);
+  border-color: rgba(139, 92, 246, 0.4);
+  transform: translateY(-1px);
+}
+
+.launch-icon {
+  font-size: 13px;
+}
+
+.btn {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+  transition: all 0.2s ease;
+}
+
+.btn.primary {
+  background: linear-gradient(135deg, #8B5CF6, #6D28D9);
+  color: white;
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, #9D74FF, #7C3AED);
+}
+
+.btn.secondary {
+  background: rgba(255, 255, 255, 0.08);
+  color: #E2E8F0;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.btn.secondary:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.instructions {
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 11px;
+  color: #94A3B8;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.inst-title {
+  font-weight: 600;
+  color: #CBD5E1;
+}
+
+.instructions ol {
+  padding-left: 16px;
+  line-height: 1.6;
+}
+
+.instructions li b {
+  color: #E2E8F0;
+}
