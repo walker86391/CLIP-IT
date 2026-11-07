@@ -24,6 +24,7 @@ import sys
 import time
 import math
 import json
+import warnings
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -32,6 +33,9 @@ import soundfile as sf
 from scipy.ndimage import median_filter
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -280,13 +284,48 @@ class HinglishSpeechPipeline:
         self.processor = AutoProcessor.from_pretrained(self.model_dir)
         torch_dtype = torch.float32
 
-        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            self.model_dir,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-            use_safetensors=True,
-            device_map="auto" if torch.cuda.is_available() else None,
-        )
+        # Intelligent Hardware & Memory Topology Selection:
+        # Avoid device_map="auto" disk offloading on GPUs with < 7.5GB VRAM.
+        req_vram_gb = 7.5
+        config_path = os.path.join(self.model_dir, "config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as cf:
+                    cfg = json.load(cf)
+                    if cfg.get("decoder_layers", 32) <= 6:
+                        req_vram_gb = 3.0
+            except Exception:
+                pass
+
+        use_gpu = False
+        target_device = torch.device("cpu")
+        if torch.cuda.is_available():
+            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            torch.cuda.empty_cache()
+            free_vram_gb = total_vram_gb - (torch.cuda.memory_allocated(0) / (1024 ** 3))
+            if free_vram_gb >= req_vram_gb:
+                use_gpu = True
+                target_device = torch.device("cuda:0")
+
+        if use_gpu:
+            self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                self.model_dir,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+                attn_implementation="sdpa",
+            ).to(target_device)
+        else:
+            cores = os.cpu_count() or 4
+            num_threads = max(2, min(cores - 1, 10))
+            if hasattr(torch, "set_num_threads"):
+                torch.set_num_threads(num_threads)
+            self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                self.model_dir,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+            ).to("cpu")
         self.model.eval()
 
         # Suppress transformers max_length/max_new_tokens warning

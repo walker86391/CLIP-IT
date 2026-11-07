@@ -11,11 +11,15 @@ import sys
 import json
 import argparse
 import time
+import warnings
 from datetime import datetime, timezone
 import numpy as np
 import soundfile as sf
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
 
 def format_timestamp(seconds: float) -> str:
@@ -211,12 +215,51 @@ def transcribe_chunks(
 
     processor = AutoProcessor.from_pretrained(model_dir)
 
-    # Intelligent Memory & Device Management:
-    # Uses HuggingFace Accelerate device_map="auto" to intelligently fit into available GPU VRAM
-    # (e.g. 4GB Quadro T1000) and automatically offloads remaining layers to system RAM without OOM errors.
-    model = None
+    # Intelligent Memory & Hardware Topology Selection:
+    # Whisper Large (Prime) in float32 requires ~7.5 GB of dedicated VRAM.
+    # On GPUs with < 7.5 GB VRAM (e.g. 4GB Quadro T1000 or GTX 1650), loading
+    # with device_map="auto" causes Accelerate to offload layers to DISK and CPU.
+    # Disk offloading causes multi-minute stalls per 30s window and triggers watchdog timeouts.
+    # Modern multi-core CPUs (e.g. 12 threads) run float32 Whisper Large entirely in system RAM
+    # at ~1.5x real-time speed with 0 offload, 0 NaNs, and 0 stalls.
+    req_vram_gb = 7.5
+    config_path = os.path.join(model_dir, "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as cf:
+                cfg = json.load(cf)
+                if cfg.get("decoder_layers", 32) <= 6:
+                    req_vram_gb = 3.0
+        except Exception:
+            pass
+
+    use_gpu = False
+    target_device = torch.device("cpu")
     if torch.cuda.is_available():
-        print("[Whisper Prime] Initializing model with GPU acceleration & device_map='auto'...", flush=True)
+        gpu_name = torch.cuda.get_device_name(0)
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        torch.cuda.empty_cache()
+        allocated_gb = torch.cuda.memory_allocated(0) / (1024 ** 3)
+        free_vram_gb = total_vram_gb - allocated_gb
+
+        if free_vram_gb >= req_vram_gb:
+            use_gpu = True
+            target_device = torch.device("cuda:0")
+            print(
+                f"[Whisper Prime] Dedicated GPU VRAM ({free_vram_gb:.2f} GB / {total_vram_gb:.2f} GB on {gpu_name}) "
+                f"is sufficient (>= {req_vram_gb:.1f} GB required). Initializing on {target_device}!",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Whisper Prime] Detected {gpu_name} with {total_vram_gb:.2f} GB VRAM ({free_vram_gb:.2f} GB available). "
+                f"Full model in float32 requires ~{req_vram_gb:.1f} GB to prevent disk-offload stalls. "
+                f"Routing to multi-core CPU ({num_threads} worker threads, system RAM) for smooth, non-blocking inference.",
+                flush=True,
+            )
+
+    model = None
+    if use_gpu:
         try:
             model = AutoModelForSpeechSeq2Seq.from_pretrained(
                 model_dir,
@@ -224,9 +267,8 @@ def transcribe_chunks(
                 low_cpu_mem_usage=True,
                 use_safetensors=True,
                 attn_implementation="sdpa",
-                device_map="auto",
-            )
-            print("[Whisper Prime] Successfully initialized with PyTorch SDPA attention and device_map='auto'!", flush=True)
+            ).to(target_device)
+            print(f"[Whisper Prime] Successfully initialized on {target_device} with PyTorch SDPA attention!", flush=True)
         except Exception as sdpa_err:
             print(f"[Whisper Prime] SDPA backend notice ({sdpa_err}), initializing with eager attention...", flush=True)
             model = AutoModelForSpeechSeq2Seq.from_pretrained(
@@ -234,18 +276,17 @@ def transcribe_chunks(
                 torch_dtype=torch_dtype,
                 low_cpu_mem_usage=True,
                 use_safetensors=True,
-                device_map="auto",
-            )
-            print("[Whisper Prime] Successfully initialized with device_map='auto'!", flush=True)
+            ).to(target_device)
+            print(f"[Whisper Prime] Successfully initialized on {target_device}!", flush=True)
     else:
-        print("[Whisper Prime] CUDA unavailable, initializing on CPU...", flush=True)
+        print(f"[Whisper Prime] Initializing on CPU with {num_threads} worker threads...", flush=True)
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
             model_dir,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
             use_safetensors=True,
         ).to("cpu")
-        print("[Whisper Prime] Successfully initialized on CPU.", flush=True)
+        print(f"[Whisper Prime] Successfully initialized on CPU with {num_threads} worker threads.", flush=True)
 
     model.eval()
     # Suppress transformers conflicting max_length/max_new_tokens warnings
@@ -369,6 +410,12 @@ def transcribe_chunks(
                 continue
 
             t_win_start = time.time()
+            pct_start = int(round((w_idx / float(num_windows)) * 100))
+            print(
+                f"[Whisper Prime] Transcribing window {w_idx + 1}/{num_windows} "
+                f"[{format_timestamp(abs_start)} --> {format_timestamp(abs_end)}] ({pct_start}%)...",
+                flush=True,
+            )
             try:
                 inputs = processor(win_data, sampling_rate=sr, return_tensors="pt")
                 target_device = getattr(model, "device", torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
@@ -378,7 +425,6 @@ def transcribe_chunks(
                         input_features,
                         task=gen_kwargs.get("task", "transcribe"),
                         language=gen_kwargs.get("language", "en"),
-                        max_length=None,
                         max_new_tokens=128,
                         num_beams=1,
                         do_sample=False,

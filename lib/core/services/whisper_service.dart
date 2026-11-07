@@ -320,7 +320,7 @@ class WhisperService {
 
       final stderrBuffer = StringBuffer();
       DateTime lastActivityTime = DateTime.now();
-      const stallInactivityTimeout = Duration(minutes: 5);
+      const stallInactivityTimeout = Duration(minutes: 10);
       bool hasStalled = false;
 
       // Inactivity Watchdog: Detects if whisper engine freezes or stalls without output
